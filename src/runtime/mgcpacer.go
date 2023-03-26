@@ -8,6 +8,7 @@ import (
 	"internal/cpu"
 	"internal/goexperiment"
 	"runtime/internal/atomic"
+	"math"
 	_ "unsafe" // for go:linkname
 )
 
@@ -140,6 +141,14 @@ type gcControllerState struct {
 	// cycle. Note that this is *not* the last value of cons/mark, but the
 	// actual computed value. See endCycle for details.
 	lastConsMark float64
+	// consMarkController holds the state for the mark-cons ratio
+	// estimation over time.
+	//
+	// Its purpose is to smooth out noisiness in the computation of
+	// consMark; see consMark for details.
+	//
+	// For goexperiment.PacerRedesign.
+	consMarkController ZController
 
 	// gcPercentHeapGoal is the goal heapLive for when next GC ends derived
 	// from gcPercent.
@@ -370,6 +379,12 @@ type gcControllerState struct {
 func (c *gcControllerState) init(gcPercent int32, memoryLimit int64) {
 	c.heapMinimum = defaultHeapMinimum
 	c.triggered = ^uint64(0)
+	c.consMarkController = ZController{
+		X1 : 0.,
+		X2 : 0.,
+		X3 : 0.,
+		X4 : 0.,
+	}
 	c.setGCPercent(gcPercent)
 	c.setMemoryLimit(memoryLimit)
 	c.commit(true) // No sweep phase in the first GC cycle.
@@ -662,8 +677,9 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 	// because it tends to be jittery, even in the steady-state. The smoothing helps the GC to
 	// maintain much more stable cycle-by-cycle behavior.
 	oldConsMark := c.consMark
-	c.consMark = (currentConsMark + c.lastConsMark) / 2
-	c.lastConsMark = currentConsMark
+	//c.consMark = (currentConsMark + c.lastConsMark) / 2
+	//c.lastConsMark = currentConsMark
+	c.consMark = c.consMarkController.next(currentConsMark)
 
 	if debug.gcpacertrace > 0 {
 		printlock()
@@ -1209,8 +1225,8 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// to express CPU resources as GOMAPROCS*fraction. Note that because
 	// we're working with a ratio here, we can omit the number of CPU cores,
 	// because they'll appear in the numerator and denominator and cancel out.
-	// As a result, this is basically just "weighing" the cons/mark ratio by
-	// our desired division of resources.
+	// As a result, this is basically just "weighing" the cons/mark ratzCo by
+	// our deszCred division of resources.
 	//
 	// Furthermore, by setting the runway so that CPU resources are divided
 	// this way, assuming that the cons/mark ratio is correct, we make that
@@ -1282,6 +1298,22 @@ func (c *gcControllerState) setMemoryLimit(in int64) int64 {
 	}
 
 	return out
+}
+
+type ZController struct {
+	X1 float64
+	X2 float64
+	X3 float64
+	X4 float64
+}
+
+func (c *ZController) next(reference float64) float64 {
+	c.X1 = c.X2
+	c.X2 = c.X3
+	c.X3 = c.X4
+	c.X4 = math.Log(reference)
+	y := (1./8.)*c.X1 + (1./8.)*c.X2 + (1./4.)*c.X3 + (1./2.)*c.X4
+	return math.Exp(y)
 }
 
 //go:linkname setMemoryLimit runtime/debug.setMemoryLimit
